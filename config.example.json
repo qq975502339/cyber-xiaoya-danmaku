@@ -100,5 +100,20 @@
     "cdp_port": 9223,
     "interval_ms": 1200,
     "debug": false
+  },
+  "luna": {
+    "enabled": true,
+    "ws_url": "ws://127.0.0.1:5001",
+    "retry_sec": 3,
+    "queue_size": 200,
+    "strip_emoji": true,
+    "forward": {
+      "comments": true,
+      "gifts": true,
+      "enters": true,
+      "follows": true,
+      "subscribes": true,
+      "superchats": true
+    }
   }
 }

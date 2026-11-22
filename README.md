@@ -98,6 +98,20 @@ copy config.example.json config.json
 
 `reader.py` 会自己判断哪些事件该念、哪些只通知（看 `config.json → read` 里的开关）。
 
+### 4.1 换成 Luna AI（AI-Vtuber）当数字人
+
+不想用上面那套数字人桥、而是让 **[Luna AI](https://github.com/Ikaros-521/AI-Vtuber)** 来念和答？
+Luna 自己就有个「直播弹幕监听助手」入口（websocket `127.0.0.1:5001`），
+所以**不用改 Luna**，跑本仓库的桥接脚本把事件推过去就行：
+
+```powershell
+py -3 luna_bridge.py --only wechat --open-browser   # 视频号 → Luna
+py -3 luna_bridge.py --test                          # 先验证 5001 通不通
+```
+
+完整步骤、配置对照、排错见 [docs-ref/luna_bridge.md](./docs-ref/luna_bridge.md)。
+⚠️ `luna_bridge.py` 不做语音，跑它的时候别再开 `reader.py`，否则一句弹幕念两遍。
+
 ## 5. 配置速查
 
 | 段 | 关键字段 |
@@ -107,6 +121,7 @@ copy config.example.json config.json
 | `youtube` | `enabled` / `video_id` / `channel` / `discover_sec` |
 | `wechat` | `enabled` / `cdp_port` |
 | `tts` | `output` / `dh_url` / `volume` |
+| `luna` | `ws_url`（Luna 的 5001）/ `forward.*`（推哪类事件）/ `strip_emoji` |
 | `read` | 念什么（comments/gifts/joins/follows/likes/guards）、模板、黑名单、VIP 门槛 |
 
 ## 6. 安全提示
