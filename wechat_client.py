@@ -40,7 +40,7 @@ JS_COLLECT = r"""
     return null;
   };
   const d = pick();
-  if (!d) return JSON.stringify({ ok: false, reason: 'no-console' });
+  if (!d) return JSON.stringify({ ok: false, reason: 'no-console', href: String(location.href || '') });
   const sc = d.querySelector('.comment__list');
   const items = [...sc.querySelectorAll('.live-message-item')];
   const out = items.map(el => {
@@ -58,8 +58,8 @@ JS_COLLECT = r"""
 })()
 """
 
-# 系统/非真人评论的身份标签, 直接忽略
-SKIP_BADGES = {"通知", "主题", "系统", "公告"}
+# 系统/非真人/主播自身评论的身份标签, 直接忽略
+SKIP_BADGES = {"通知", "主题", "系统", "公告", "主播"}
 NICK_TAIL = re.compile(r"[:：]\s*$")
 CONSOLE_URL = "https://channels.weixin.qq.com/platform/live/liveBuild"
 
@@ -78,10 +78,13 @@ class WechatConsoleClient(threading.Thread):
         self.stop = threading.Event()
         self.ws: WSClient | None = None
         self._seq = 0
-        self._recent: deque = deque(maxlen=24)   # 已读指纹, 用于增量判断
+        # 上一次轮询看到的规范化评论序列 [(nick, content), ...]；用尾部重叠对齐取增量，
+        # 彻底避免固定 24 条滑窗在 DOM 超 24 条时无限重放，也避免 24 条内同人同字被吞。
+        self._last_items: list[tuple[str, str]] = []
         self._baseline_done = False
         self._last_warn = 0.0
         self._miss = 0
+        self._eval_fail = 0
         self._last_nav = 0.0
         self.status = "未连接"
 
@@ -94,7 +97,7 @@ class WechatConsoleClient(threading.Thread):
             return json.loads(r.read().decode("utf-8", "replace"))
 
     def _find_page(self) -> dict | None:
-        """找「视频号助手」页面目标(含中控台/弹幕页)。"""
+        """找「视频号助手」页面目标(含中控台/弹幕页)；找不到时不乱接管其它无关标签页。"""
         try:
             pages = [t for t in self._http_json("/json/list") if t.get("type") == "page"]
         except Exception:
@@ -102,7 +105,7 @@ class WechatConsoleClient(threading.Thread):
         for p in pages:
             if "channels.weixin.qq.com" in (p.get("url") or ""):
                 return p
-        return pages[0] if pages else None
+        return None
 
     def _connect(self) -> bool:
         page = self._find_page()
@@ -165,6 +168,7 @@ class WechatConsoleClient(threading.Thread):
         except Exception:
             pass
         self.ws = None
+        self._eval_fail = 0
         self.status = "连接断开"
 
     # ────────────────────── 主循环 ──────────────────────
@@ -180,9 +184,16 @@ class WechatConsoleClient(threading.Thread):
                 continue
 
             raw = self._eval(JS_COLLECT, timeout=6.0)
-            if raw is None and self.debug:
-                dim_log("[视频号] 本次轮询无响应 (CDP 超时)")
-            if raw:
+            if raw is None:
+                self._eval_fail += 1
+                self._miss += 1
+                if self.debug:
+                    dim_log(f"[视频号] 本次轮询无响应 (CDP 超时 {self._eval_fail}/3)")
+                if self._eval_fail >= 3:
+                    platform_log("视频号", "CDP 连续 3 次无响应，主动断开重连…", yellow=True)
+                    self._drop_conn()
+            else:
+                self._eval_fail = 0
                 try:
                     data = json.loads(raw)
                 except Exception:
@@ -191,14 +202,19 @@ class WechatConsoleClient(threading.Thread):
                     self._miss = 0
                     self._handle_items(data.get("items") or [])
                 elif data and data.get("reason") == "no-console":
-                    self._maybe_navigate()
-            else:
-                self._miss += 1
+                    self._maybe_navigate(str(data.get("href") or ""))
             self.stop.wait(self.interval)
         self._drop_conn()
 
-    def _maybe_navigate(self):
-        """页面上找不到评论列表时, 自动把调试浏览器导航到直播中控台。"""
+    def _maybe_navigate(self, href: str = ""):
+        """页面上找不到评论列表时, 自动把调试浏览器导航到直播中控台（扫码登录页除外）。"""
+        lower_href = href.lower()
+        if any(k in lower_href for k in ("login", "auth", "qrcode", "scan")):
+            now = time.time()
+            if now - self._last_warn > 30:
+                self._last_warn = now
+                platform_log("视频号", "检测到登录/扫码页面，暂不自动跳转，请先扫码登录", yellow=True)
+            return
         self._miss += 1
         now = time.time()
         if self._miss >= 3 and now - self._last_nav > 60:
@@ -210,8 +226,21 @@ class WechatConsoleClient(threading.Thread):
         elif self._miss == 3 and self.debug:
             dim_log("[视频号] 页面上没有评论列表 (等待自动跳转冷却)")
 
+    @staticmethod
+    def _diff_new_items(prev: list[tuple[str, str]], cur: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """用尾部最大重叠对齐提取新增条目（适配任意长度 DOM 列表与同人重复发言）。"""
+        if not cur:
+            return []
+        if not prev:
+            return cur
+        max_ov = min(len(prev), len(cur))
+        for ov in range(max_ov, 0, -1):
+            if prev[-ov:] == cur[:ov]:
+                return cur[ov:]
+        return cur
+
     def _handle_items(self, items):
-        fresh = []
+        cur: list[tuple[str, str]] = []
         for it in items:
             nick = (it.get("nick") or "").strip()
             content = (it.get("content") or "").strip()
@@ -221,19 +250,20 @@ class WechatConsoleClient(threading.Thread):
             if not content:
                 continue
             nick = NICK_TAIL.sub("", nick)
-            fp = f"{nick}|{content}"
-            if fp in self._recent:
-                continue
-            self._recent.append(fp)
             if nick:
-                fresh.append((nick, content))
+                cur.append((nick, content))
 
         if not self._baseline_done:
             # 首次连接只建立基线, 不朗读历史评论
+            self._last_items = cur
             self._baseline_done = True
-            if fresh and self.debug:
-                dim_log(f"[视频号] 基线 {len(fresh)} 条历史评论已跳过")
+            if cur and self.debug:
+                dim_log(f"[视频号] 基线 {len(cur)} 条历史评论已跳过")
             return
+
+        fresh = self._diff_new_items(self._last_items, cur)
+        if cur:
+            self._last_items = cur
 
         if self.debug:
             dim_log(f"[视频号] 轮询: 列表 {len(items)} 条, 新增 {len(fresh)} 条")

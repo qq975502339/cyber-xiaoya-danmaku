@@ -173,9 +173,12 @@ def to_luna(ev: dict, forward: dict, strip_emoji: bool = True) -> dict | None:
     if not isinstance(d, dict):
         return None
 
-    nick = clean_text(d.get("name") or "", strip_emoji)
-    if not nick:                                  # Luna 侧 username 是必填，空名只会念出空档
-        return None
+    raw_name = str(d.get("name") or "").strip()
+    nick = clean_text(raw_name, strip_emoji)
+    if not nick:                                  # 纯 Emoji 昵称兜底，不丢弃该观众弹幕/礼物
+        if not raw_name:
+            return None
+        nick = "有位观众"
 
     if etype == "chat":
         if not forward.get("comments", True):
@@ -344,7 +347,14 @@ class LunaLink(threading.Thread):
                         line = self.q.get(timeout=0.5)
                     except queue.Empty:
                         continue
-                    ws.send_text(line)
+                    try:
+                        ws.send_text(line)
+                    except Exception:
+                        try:
+                            self.q.put_nowait(line)  # 发送失败时放回队列，重连后补发不丢条
+                        except queue.Full:
+                            pass
+                        raise
                     self.sent += 1
                     dim_log(f"[Luna] → {line[:90]}")
             except Exception as e:                 # noqa: BLE001 - 任何发送异常都走重连
